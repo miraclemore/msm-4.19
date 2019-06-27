@@ -105,6 +105,8 @@ struct ath10k_sdio_bus_request {
 	u32 address;
 
 	struct sk_buff *skb;
+	u8 *buf;
+	size_t buf_len;
 	enum ath10k_htc_ep_id eid;
 	int status;
 	/* Specifies if the current request is an HTC message.
@@ -195,6 +197,8 @@ struct ath10k_sdio {
 
 	struct ath10k *ar;
 	struct ath10k_sdio_irq_data irq_data;
+
+	u8 *sdio_read_buf;
 
 	/* temporary buffer for BMI requests */
 	u8 *bmi_buf;

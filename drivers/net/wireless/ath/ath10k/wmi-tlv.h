@@ -1941,6 +1941,7 @@ struct wmi_tlv_vdev_stats {
 } __packed;
 
 struct wmi_tlv_pktlog_enable {
+	__le32 pdev_id;
 	__le32 reserved;
 	__le32 filter;
 } __packed;
@@ -2000,6 +2001,11 @@ struct wmi_tlv_diag_item {
 
 struct wmi_tlv_diag_data_ev {
 	__le32 num_items;
+} __packed;
+
+struct wmi_tlv_peer_sta_kickout_event {
+	struct wmi_mac_addr peer_macaddr;
+	__le32 reason;
 } __packed;
 
 struct wmi_tlv_sta_keepalive_cmd {

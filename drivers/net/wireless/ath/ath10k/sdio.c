@@ -24,6 +24,8 @@
 #include "trace.h"
 #include "sdio.h"
 
+#define ATH10K_SDIO_READ_BUF_SIZE	(32 * 1024)
+
 /* inlined helper functions */
 
 static inline int ath10k_sdio_calc_txrx_padded_len(struct ath10k_sdio *ar_sdio,
@@ -627,40 +629,72 @@ err:
 	return ret;
 }
 
-static int ath10k_sdio_mbox_rx_packet(struct ath10k *ar,
-				      struct ath10k_sdio_rx_data *pkt)
-{
-	struct ath10k_sdio *ar_sdio = ath10k_sdio_priv(ar);
-	struct sk_buff *skb = pkt->skb;
-	int ret;
-
-	ret = ath10k_sdio_readsb(ar, ar_sdio->mbox_info.htc_addr,
-				 skb->data, pkt->alloc_len);
-	pkt->status = ret;
-	if (!ret)
-		skb_put(skb, pkt->act_len);
-
-	return ret;
-}
-
 static int ath10k_sdio_mbox_rx_fetch(struct ath10k *ar)
 {
 	struct ath10k_sdio *ar_sdio = ath10k_sdio_priv(ar);
+	struct ath10k_sdio_rx_data *pkt = &ar_sdio->rx_pkts[0];
+	struct sk_buff *skb = pkt->skb;
+	int ret;
+
+	ret = ath10k_sdio_read(ar, ar_sdio->mbox_info.htc_addr,
+			       skb->data, pkt->alloc_len);
+	if (ret) {
+		ath10k_warn(ar, "sdio_read error %d\n", ret);
+		goto err;
+	}
+
+	pkt->status = ret;
+	skb_put(skb, pkt->act_len);
+
+	return 0;
+
+err:
+	ar_sdio->n_rx_pkts = 0;
+	ath10k_sdio_mbox_free_rx_pkt(pkt);
+	return ret;
+}
+
+static int ath10k_sdio_mbox_rx_fetch_bundle(struct ath10k *ar)
+{
+	struct ath10k_sdio *ar_sdio = ath10k_sdio_priv(ar);
+	struct ath10k_sdio_rx_data *pkt;
 	int ret, i;
+	u32 pkt_offset = 0, pkt_bundle_len = 0;
+
+	for (i = 0; i < ar_sdio->n_rx_pkts; i++)
+		pkt_bundle_len += ar_sdio->rx_pkts[i].alloc_len;
+
+	if (pkt_bundle_len > ATH10K_SDIO_READ_BUF_SIZE) {
+		ret = -ENOSPC;
+		ath10k_warn(ar, "bundle size (%d) exceeding limit %d\n",
+			    pkt_bundle_len, ATH10K_SDIO_READ_BUF_SIZE);
+		goto err;
+	}
+
+	ret = ath10k_sdio_readsb(ar, ar_sdio->mbox_info.htc_addr,
+				 ar_sdio->sdio_read_buf, pkt_bundle_len);
+	if (ret)
+		goto err;
 
 	for (i = 0; i < ar_sdio->n_rx_pkts; i++) {
-		ret = ath10k_sdio_mbox_rx_packet(ar,
-						 &ar_sdio->rx_pkts[i]);
-		if (ret)
-			goto err;
+		struct sk_buff *skb = ar_sdio->rx_pkts[i].skb;
+
+		pkt = &ar_sdio->rx_pkts[i];
+		skb_put(skb, pkt->act_len);
+		memcpy(skb->data, ar_sdio->sdio_read_buf + pkt_offset,
+		       pkt->alloc_len);
+		pkt->status = 0;
+		pkt_offset += pkt->alloc_len;
 	}
 
 	return 0;
 
 err:
 	/* Free all packets that was not successfully fetched. */
-	for (; i < ar_sdio->n_rx_pkts; i++)
+	for (i = 0; i < ar_sdio->n_rx_pkts; i++)
 		ath10k_sdio_mbox_free_rx_pkt(&ar_sdio->rx_pkts[i]);
+
+	ar_sdio->n_rx_pkts = 0;
 
 	return ret;
 }
@@ -704,7 +738,10 @@ static int ath10k_sdio_mbox_rxmsg_pending_handler(struct ath10k *ar,
 			 */
 			*done = false;
 
-		ret = ath10k_sdio_mbox_rx_fetch(ar);
+		if (ar_sdio->n_rx_pkts > 1)
+			ret = ath10k_sdio_mbox_rx_fetch_bundle(ar);
+		else
+			ret = ath10k_sdio_mbox_rx_fetch(ar);
 
 		/* Process fetched packets. This will potentially update
 		 * n_lookaheads depending on if the packets contain lookahead
@@ -1250,6 +1287,7 @@ static void ath10k_sdio_free_bus_req(struct ath10k *ar,
 {
 	struct ath10k_sdio *ar_sdio = ath10k_sdio_priv(ar);
 
+	kfree(bus_req->buf);
 	memset(bus_req, 0, sizeof(*bus_req));
 
 	spin_lock_bh(&ar_sdio->lock);
@@ -1265,7 +1303,7 @@ static void __ath10k_sdio_write_async(struct ath10k *ar,
 	int ret;
 
 	skb = req->skb;
-	ret = ath10k_sdio_write(ar, req->address, skb->data, skb->len);
+	ret = ath10k_sdio_write(ar, req->address, req->buf, req->buf_len);
 	if (ret)
 		ath10k_warn(ar, "failed to write skb to 0x%x asynchronously: %d",
 			    req->address, ret);
@@ -1301,6 +1339,7 @@ static void ath10k_sdio_write_async_work(struct work_struct *work)
 
 static int ath10k_sdio_prep_async_req(struct ath10k *ar, u32 addr,
 				      struct sk_buff *skb,
+				      size_t alloc_len,
 				      struct completion *comp,
 				      bool htc_msg, enum ath10k_htc_ep_id eid)
 {
@@ -1314,9 +1353,17 @@ static int ath10k_sdio_prep_async_req(struct ath10k *ar, u32 addr,
 	if (!bus_req) {
 		ath10k_warn(ar,
 			    "unable to allocate bus request for async request\n");
-		return -ENOMEM;
+		goto err;
 	}
 
+	bus_req->buf_len = alloc_len;
+	bus_req->buf = kzalloc(alloc_len, GFP_NOFS);
+	if (!bus_req->buf) {
+		ath10k_warn(ar,
+			    "unable to allocate data buffer for bus request\n");
+		goto err_free_bus_req;
+	}
+	memcpy(bus_req->buf, skb->data, skb->len);
 	bus_req->skb = skb;
 	bus_req->eid = eid;
 	bus_req->address = addr;
@@ -1328,6 +1375,11 @@ static int ath10k_sdio_prep_async_req(struct ath10k *ar, u32 addr,
 	spin_unlock_bh(&ar_sdio->wr_async_lock);
 
 	return 0;
+
+err_free_bus_req:
+	ath10k_sdio_free_bus_req(ar, bus_req);
+err:
+	return -ENOMEM;
 }
 
 /* IRQ handler */
@@ -1472,12 +1524,11 @@ static int ath10k_sdio_hif_tx_sg(struct ath10k *ar, u8 pipe_id,
 		skb = items[i].transfer_context;
 		padded_len = ath10k_sdio_calc_txrx_padded_len(ar_sdio,
 							      skb->len);
-		skb_trim(skb, padded_len);
 
 		/* Write TX data to the end of the mbox address space */
 		address = ar_sdio->mbox_addr[eid] + ar_sdio->mbox_size[eid] -
-			  skb->len;
-		ret = ath10k_sdio_prep_async_req(ar, address, skb,
+			  padded_len;
+		ret = ath10k_sdio_prep_async_req(ar, address, skb, padded_len,
 						 NULL, true, eid);
 		if (ret)
 			return ret;
@@ -1739,7 +1790,8 @@ static void ath10k_sdio_irq_disable(struct ath10k *ar)
 
 	init_completion(&irqs_disabled_comp);
 	ret = ath10k_sdio_prep_async_req(ar, MBOX_INT_STATUS_ENABLE_ADDRESS,
-					 skb, &irqs_disabled_comp, false, 0);
+					 skb, skb->len, &irqs_disabled_comp,
+					 false, 0);
 	if (ret)
 		goto out;
 
@@ -2021,6 +2073,14 @@ static int ath10k_sdio_probe(struct sdio_func *func,
 		goto err_core_destroy;
 	}
 
+	ar_sdio->sdio_read_buf = devm_kzalloc(ar->dev,
+					      ATH10K_SDIO_READ_BUF_SIZE,
+					      GFP_KERNEL);
+	if (!ar_sdio->sdio_read_buf) {
+		ret = -ENOMEM;
+		goto err_core_destroy;
+	}
+
 	ar_sdio->func = func;
 	sdio_set_drvdata(func, ar_sdio);
 
@@ -2097,6 +2157,9 @@ static void ath10k_sdio_remove(struct sdio_func *func)
 
 	ath10k_core_unregister(ar);
 	ath10k_core_destroy(ar);
+
+	flush_workqueue(ar_sdio->workqueue);
+	destroy_workqueue(ar_sdio->workqueue);
 }
 
 static const struct sdio_device_id ath10k_sdio_devices[] = {
